@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import fs from 'node:fs';import ts from 'typescript';
+const compile=s=>ts.transpileModule(s,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}}).outputText;
+const catalogUrl='data:text/javascript;base64,'+Buffer.from(compile(fs.readFileSync('lib/catalog.ts','utf8'))).toString('base64');
+const {products,totals}=await import(catalogUrl);
+assert.equal(totals([{id:'mug',qty:2}],products,'NEXO10','pickup').total,8982);
+assert.throws(()=>totals([{id:'mug',qty:99}],products,'','pickup'));
+const db=new DatabaseSync(':memory:');db.exec('PRAGMA foreign_keys=ON');db.exec(fs.readFileSync('drizzle/0000_late_reaper.sql','utf8'));
+function prepare(sql){return {sql,args:[],bind(...args){this.args=args;return this},async all(){return {results:db.prepare(sql).all(...this.args)}},async first(){return db.prepare(sql).get(...this.args)||null},async run(){return db.prepare(sql).run(...this.args)}}}
+globalThis.__db={prepare,async batch(ss){db.exec('BEGIN');try{for(const s of ss)db.prepare(s.sql).run(...s.args);db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e}}};
+let src=fs.readFileSync('app/api/shop/route.ts','utf8').replace("import {getChatGPTUser} from '@/app/chatgpt-auth';","const getChatGPTUser=async()=>globalThis.__user;").replace("import {database} from '@/lib/server-db';","const database=()=>globalThis.__db;").replace("from '@/lib/catalog'","from '"+catalogUrl+"'");
+const route=await import('data:text/javascript;base64,'+Buffer.from(compile(src)).toString('base64'));
+const base='https://nexo.test';async function post(body,origin=base){const r=await route.POST(new Request(base+'/api/shop',{method:'POST',headers:{'Content-Type':'application/json',origin},body:JSON.stringify(body)}));return [r.status,await r.json()]}
+globalThis.__user=null;assert.equal((await post({action:'cart',id:'mug',qty:1}))[0],401);
+globalThis.__user={userId:'client-a',email:'a@example.invalid'};
+assert.equal((await post({action:'cart',id:'mug',qty:1},'https://evil.test'))[0],403);
+assert.equal((await post({action:'product',id:'mug',price:100,stock:4,name:'teste'}))[0],403);
+assert.equal((await post({action:'samples'}))[0],403);
+assert.equal((await post({action:'cart',id:'mug',qty:2}))[0],200);
+assert.equal((await post({action:'favorite',id:'mug',value:true}))[0],200);
+assert.equal((await post({action:'checkout',delivery:'pickup',method:'pix',coupon:'',key:'one'}))[0],400);
+assert.equal((await post({action:'profile',name:'Cliente fictício',phone:'11999999999',address:'Rua Exemplo 100'}))[0],200);
+let [status,d]=await post({action:'checkout',delivery:'pickup',method:'pix',coupon:'NEXO10',key:'one'});assert.equal(status,200);const id=d.id;
+assert.equal(db.prepare('SELECT total FROM orders WHERE id=?').get(id).total,8982);
+assert.equal(db.prepare('SELECT count(*) n FROM carts').get().n,0);
+assert.equal((await post({action:'checkout',delivery:'pickup',method:'pix',coupon:'NEXO10',key:'one'}))[1].id,id);
+globalThis.__user={userId:'client-b',email:'b@example.invalid'};const other=await (await route.GET()).json();assert.equal(other.orders.length,0);assert.equal(other.favorites.length,0);assert.equal(other.profile,null);
+globalThis.__user={userId:'admin',email:'repratavieira2014@gmail.com'};assert.equal((await post({action:'samples'}))[0],200);assert.equal((await post({action:'samples'}))[0],200);assert.equal(db.prepare('SELECT count(*) n FROM orders').get().n,19);
+assert.equal((await post({action:'status',id,status:'preparing'}))[0],200);
+assert.equal((await post({action:'product',id:'mug',price:5990,stock:4,name:'Caneca atualizada'}))[0],200);
+const data=await (await route.GET()).json();assert.equal(data.products.find(x=>x.id==='mug').price,5990);
+console.log('Carrinho, totais, cupom, isolamento de clientes, autorização, CSRF, idempotência e edição verificados.');
